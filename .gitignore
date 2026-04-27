@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+*.pyo
+*.html
+!README.md
+*.json
+*.log
+.DS_Store
