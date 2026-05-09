@@ -4,13 +4,12 @@ import platform
 import json
 import re
 from datetime import datetime
-import time
+import sys
 
 import nodriver as uc
 
 CONFIG_FILE = "config.json"
 COOKIE_FILE = "cookies.json"
-CHECKPOINT_FILE = "checkpoint.json"
 
 BELM_MAP = {
     "puri": {"id": "21", "name": "Puri Indah"},
@@ -32,14 +31,23 @@ def load_config():
 CONFIG = load_config()
 EMAIL = CONFIG.get("email")
 PASSWORD = CONFIG.get("password")
+PROXY = CONFIG.get("proxy", "")
+CHECKPOINT_FILE = "checkpoint.json"
+
+def save_checkpoint(data):
+    data["timestamp"] = datetime.now().isoformat()
+    with open(CHECKPOINT_FILE, "w") as f:
+        json.dump(data, f, indent=2)
 
 def _find_chrome():
     if os.environ.get("CHROME_PATH"):
         return os.environ["CHROME_PATH"]
     if platform.system() == "Windows":
-        cand = [r"C:\Program Files\Google\Chrome\Application\chrome.exe",
-                r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
-                os.path.expandvars(r"%LOCALAPPDATA%\Google\Chrome\Application\chrome.exe")]
+        cand = [
+            r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+            r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+            os.path.expandvars(r"%LOCALAPPDATA%\Google\Chrome\Application\chrome.exe")
+        ]
     else:
         cand = ["/usr/bin/google-chrome-stable"]
     for p in cand:
@@ -50,400 +58,355 @@ def _find_chrome():
 def _get_profile_dir():
     if os.environ.get("TS_PROFILE_DIR"):
         return os.environ["TS_PROFILE_DIR"]
-    base = os.environ.get("TEMP") or os.environ.get("TMP") or r"C:\Temp"
-    return os.path.join(base, "antrean_bot")
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "chrome_profile")
 
 def solve_captcha(text):
+    """Solve math captcha like 'Berapa hasil perhitungan dari 5 ditambah 3 ?'"""
     text = text.lower()
-    m = re.search(r"(\d+)\s*(dikali|dikurangi|dijumlahkan|ditambah)\s*(\d+)", text)
+    m = re.search(r'(\d+)\s+(dikali|dikurangi|dijumlahkan|ditambah)\s+(\d+)', text)
     if m:
         a, b = int(m.group(1)), int(m.group(3))
         op = m.group(2)
+        print(f"[*] Math: {a} {op} {b}")
         if "kali" in op:
             return a * b
-        elif "kurang" in op:
+        elif "kurang" in op or "dikurangi" in op:
             return a - b
-        return a + b
+        else:
+            return a + b
+    print(f"[!] Could not parse captcha: {text}")
     return 0
 
-def save_checkpoint(data):
-    data["timestamp"] = datetime.now().isoformat()
-    with open(CHECKPOINT_FILE, "w") as f:
-        json.dump(data, f, indent=2)
+async def do_login(page, browser):
+    """Handle login process. Returns True on success, False on failure."""
+    print("[*] Filling login form...")
 
-async def run_bot(belm_key):
-    """Langsung jalan - login + ambil antrian dlm 1 browser"""
-    print("\n" + "="*50)
-    print(f"  ANTREAN BOT - {BELM_MAP[belm_key]['name']}")
-    print("="*50 + "\n")
-    
-    # Start browser
-    print("[*] Starting Chrome...")
-    browser = await uc.start(
-        browser_executable_path=_find_chrome(),
-        headless=False,
-        user_data_dir=_get_profile_dir(),
-    )
-    
-    print("[1] Loading login page...")
-    page = await browser.get("https://antrean.logammulia.com/login")
-    await asyncio.sleep(3)
-    
-    # Get captcha
-    captcha = await page.evaluate('''(document.querySelector('label[for="aritmetika"]') || {}).innerText || "Error"''')
-    if "Error" in captcha:
-        print("[*] Already logged in")
-    else:
-        print(f"[*] Captcha: {captcha}")
-        answer = solve_captcha(captcha)
-        print(f"[*] Jawaban: {answer}")
-        
-        # Inject Turnstile
-        sitekey = "0x4AAAAAACJ3z-FPGdMU19nQ"
-        await page.evaluate(f'''
-            (() => {{
-                if (document.getElementById('_ts_box')) return;
-                window._tsToken = null;
-                const wrap = document.createElement('div');
-                wrap.id = '_ts_box';
-                wrap.style = 'position:fixed;top:20px;left:20px;z-index:2147483647;';
-                document.body.appendChild(wrap);
-                window._tsLoad = function () {{
-                    turnstile.render('#_ts_box', {{
-                        sitekey: '{sitekey}',
-                        callback: function(token) {{ window._tsToken = token; console.log('Token:', token); }}
-                    }});
-                }};
-                const s = document.createElement('script');
-                s.src = 'https://challenges.cloudflare.com/turnstile/v0/api.js?onload=_tsLoad&render=explicit';
-                document.head.appendChild(s);
-            }})();
-        ''')
-        await asyncio.sleep(8)
-        
-        # Fill form
-        await page.evaluate(f'document.querySelector(\'input[name="username"]\').value = "{EMAIL}"')
-        await page.evaluate(f'document.querySelector(\'input[name="password"]\').value = "{PASSWORD}"')
-        await page.evaluate(f'document.querySelector(\'input[name="aritmetika"]\').value = "{answer}"')
+    # Wait for form to load
+    print("[*] Waiting for login form...")
+    max_wait = 30
+    for i in range(max_wait):
         await asyncio.sleep(1)
-        print("[*] Submitting...")
-        await page.evaluate('document.querySelector(\'button[type="submit"]\').click()')
-        await asyncio.sleep(5)
-    
-    # Check login
-    html = await page.evaluate('document.documentElement.outerHTML')
-    if "logout" in html.lower():
-        print("[+] LOGIN BERHASIL!\n")
+        html = await page.get_content()
+        if 'username' in html.lower() or 'password' in html.lower():
+            print("[+] Login form loaded!")
+            break
+        if i % 5 == 4:
+            print(f"    Waiting for form... ({i+1}/{max_wait}s)")
     else:
-        print("[*] Continuing...\n")
-    
-    # Save cookies
-    cookies = await page.evaluate('document.cookie')
-    with open(COOKIE_FILE, "w") as f:
-        f.write(cookies)
-    print("[*] Cookies saved\n")
-    
-    # Go to antrean
-    print("[2] Ke halaman antrean...")
-    await page.evaluate('window.location.href = "https://antrean.logammulia.com/antrean"')
-    await asyncio.sleep(3)
-    
-    # Select BELM
-    belm = BELM_MAP[belm_key]
-    await page.evaluate(f'document.querySelector("#site").value = "{belm["id"]}"')
+        print("[!] Login form not found!")
+        return False
+
+    # Solve captcha
+    captcha_answer = ""
+    match = re.search(r'<label[^>]*for="aritmetika"[^>]*>(.*?)</label>', html, re.IGNORECASE | re.DOTALL)
+    if match:
+        captcha_text = re.sub(r'<[^>]+>', ' ', match.group(1)).strip()
+        print(f"[*] Captcha: {captcha_text}")
+        captcha_answer = str(solve_captcha(captcha_text))
+        print(f"[*] Answer: {captcha_answer}")
+    else:
+        print("[!] Could not find captcha")
+
+    # Fill fields using nodriver's element selection
+    print("[*] Filling username...")
+    try:
+        username_field = await page.find('input[name="username"]', best_match=True)
+        if username_field:
+            await username_field.send_keys(EMAIL)
+        else:
+            # Fallback to JS
+            await page.evaluate(f"document.querySelector('input[name=username]').value = {json.dumps(EMAIL)}")
+    except Exception as e:
+        print(f"[!] Error filling username: {e}")
+        await page.evaluate(f"document.querySelector('input[name=username]').value = {json.dumps(EMAIL)}")
     await asyncio.sleep(0.5)
-    await page.evaluate('document.querySelector("button").click()')
+
+    print("[*] Filling password...")
+    try:
+        password_field = await page.find('input[name="password"]', best_match=True)
+        if password_field:
+            await password_field.send_keys(PASSWORD)
+        else:
+            await page.evaluate(f"document.querySelector('input[name=password]').value = {json.dumps(PASSWORD)}")
+    except Exception as e:
+        print(f"[!] Error filling password: {e}")
+        await page.evaluate(f"document.querySelector('input[name=password]').value = {json.dumps(PASSWORD)}")
+    await asyncio.sleep(0.5)
+
+    if captcha_answer:
+        print(f"[*] Filling captcha: {captcha_answer}")
+        try:
+            captcha_field = await page.find('input[name="aritmetika"]', best_match=True)
+            if captcha_field:
+                await captcha_field.send_keys(captcha_answer)
+            else:
+                await page.evaluate(f"document.querySelector('input[name=aritmetika]').value = {json.dumps(captcha_answer)}")
+        except Exception as e:
+            print(f"[!] Error filling captcha: {e}")
+            await page.evaluate(f"document.querySelector('input[name=aritmetika]').value = {json.dumps(captcha_answer)}")
+        await asyncio.sleep(0.5)
+
+    # Wait for Turnstile
+    print("[*] Waiting for Turnstile (60s)...")
+    print("[*] Please click the checkbox!")
+    solved = False
+    for i in range(60):
+        await asyncio.sleep(1)
+        solved = await page.evaluate("document.querySelector('[name=cf-turnstile-response]')?.value?.length > 0")
+        if solved:
+            print("[+] Turnstile solved!")
+            break
+        if i % 10 == 9:
+            print(f"    Waiting... ({i+1}/60)")
+
+    if not solved:
+        print("[!] Turnstile not solved in time!")
+        return False
+
+    # Bypass jQuery validation
+    print("[*] Bypassing validation...")
+    await page.evaluate("""
+        if (window.jQuery) {
+            const v = $("#formInput").data("validator");
+            if (v) v.destroy();
+        }
+    """)
+    await asyncio.sleep(1)
+
+    # Submit
+    print("[*] Submitting...")
+    await page.evaluate("document.getElementById('formInput').submit()")
+
+    # Wait for navigation
+    print("[*] Waiting for login result...")
+    await asyncio.sleep(5)
+
+    # Check result
+    html = await page.get_content()
+    if "logout" not in html.lower():
+        print("\n[!] LOGIN GAGAL!")
+        with open("login_failed.html", "w", encoding="utf-8") as f:
+            f.write(html)
+        print("[*] HTML saved to login_failed.html")
+        return False
+
+    print("\n[+] LOGIN BERHASIL!")
+
+    # Save cookies
+    try:
+        cookies = await browser.cookies.get_all()
+        with open(COOKIE_FILE, "w") as f:
+            json.dump(cookies, f)
+        print("[*] Cookies saved")
+    except Exception as e:
+        print(f"[!] Failed to save cookies: {e}")
+
+    return True
+
+async def get_url(page):
+    """Get current URL properly handling nodriver v0.44 tuple return."""
+    try:
+        # Try page.url first
+        url = page.url
+        if url:
+            return url
+    except:
+        pass
+
+    # Fallback to evaluate with tuple handling
+    result = await page.evaluate('window.location.href')
+    if isinstance(result, tuple):
+        return result[0].value
+    elif hasattr(result, 'value'):
+        return result.value
+    return str(result)
+
+async def take_antrean(page, browser, belm_key):
+    """Take antrean for selected BELM. Returns True on success, False on failure."""
+    belm = BELM_MAP[belm_key]
+
+    # Go to antrean page
+    print(f"\n[2] Ke halaman antrean...")
+    page = await browser.get("https://antrean.logammulia.com/antrean")
+
+    # Wait for page to load
+    print("[*] Waiting for page to load...")
+    await asyncio.sleep(5)
+
+    current_url = await get_url(page)
+    print(f"[DEBUG] Current URL after navigation: {current_url}")
+
+    html = await page.get_content()
+
+    # Check if we're on the right page
+    if 'site' not in html.lower() and 'pilih' not in html.lower():
+        print("[!] Not on antrean page, got wrong page!")
+        print(f"[DEBUG] HTML snippet: {html[:500]}")
+        return False
+
+    print("[+] On antrean page, proceeding...")
+
+    # Select BELM
+    print(f"[*] Selecting BELM: {belm['name']} (ID: {belm['id']})...")
+    js_code = f"document.querySelector('#site').value = {json.dumps(belm['id'])}"
+    await page.evaluate(js_code)
+    await asyncio.sleep(1)
+
+    # Click "Tampilkan Butik" button
+    print("[*] Clicking 'Tampilkan Butik'...")
+    click_result = await page.evaluate("""() => {
+        const btns = document.querySelectorAll('button');
+        for (const btn of btns) {
+            if (btn.textContent.includes('Tampilkan') || btn.textContent.includes('Butik')) {
+                btn.click();
+                return 'Clicked: ' + btn.textContent;
+            }
+        }
+        const firstBtn = document.querySelector('button');
+        if (firstBtn) {
+            firstBtn.click();
+            return 'Clicked first button';
+        }
+        return 'Button not found';
+    }""")
+    print(f"[*] {click_result}")
+
+    # Wait for page to reload with site parameter
+    print("[*] Waiting for page to reload with site parameter...")
+    max_wait = 30
+    for i in range(max_wait):
+        await asyncio.sleep(1)
+        current_url = await get_url(page)
+        if '?site=' in current_url or f"site={belm['id']}" in current_url:
+            print(f"[+] Page reloaded. URL: {current_url}")
+            break
+        if i % 5 == 4:
+            print(f"    Waiting for URL update... ({i+1}/{max_wait}s)")
+    else:
+        print("[!] Page did not reload with ?site= within 30s")
+        print(f"[DEBUG] Current URL: {await get_url(page)}")
+        return False
+
+    # Wait for content to load
     await asyncio.sleep(3)
-    
-    # Check slot
-    print("[3] Cek ketersediaan...")
-    print("-"*30)
-    html = await page.evaluate('document.documentElement.outerHTML')
-    
-    if 'class="text-primary">Kuota Tidak Tersedia</h2>' in html:
-        m = re.search(r'Sisa.*?<span class="badge[^>]*>(\d+)</span>', html)
-        sisa = m.group(1) if m else "0"
+
+    # Check slot availability
+    print("\n[3] Cek ketersediaan...")
+    print("-" * 30)
+
+    html = await page.get_content()
+    current_url = await get_url(page)
+    print(f"[DEBUG] URL: {current_url}")
+    print(f"[DEBUG] HTML length: {len(html)} chars")
+
+    if 'Kuota Tidak Tersedia' in html or 'Kosong' in html:
         print(f"\n[!] {belm['name']}: KUOTA KOSONG")
-        print(f"    Sisa: {sisa}")
-        save_checkpoint({"status": "no_slot", "belm": belm_key, "sisa": sisa})
-        browser.stop()
-        print("\n[*] Coba lagi besok ya!\n")
-        return
-    
-    if 'action="/masuk-pool"' in html:
+        save_checkpoint({"status": "no_slot", "belm": belm_key})
+        return False
+
+    if 'masuk-pool' in html or 'Ambil Antrean' in html:
         print(f"[+] {belm['name']}: ADA KUOTA!")
         print("[*] Mengambil antrian...")
-        
-        await page.evaluate('''
-            (() => {
-                const form = document.querySelector('form[action*="masuk-pool"]');
-                if (!form) return;
-                const fd = new FormData(form);
-                const params = new URLSearchParams(fd).toString();
-                fetch(form.action, {
-                    method: "POST",
-                    body: params,
-                    headers: {"Content-Type": "application/x-www-form-urlencoded"}
-                }).then(r => r.text()).then(html => window._result = html);
-            })()
-        ''')
+
+        # Submit the form to take antrean
+        result = await page.evaluate("""() => {
+            const form = document.querySelector('form[action*="masuk-pool"]');
+            if (form) {
+                form.submit();
+                return 'Form submitted';
+            }
+            return 'Form not found';
+        }""")
+        print(f"[*] {result}")
+
+        # Wait for result
+        print("[*] Waiting for result...")
         await asyncio.sleep(5)
-        
-        result_html = await page.evaluate('window._result || document.documentElement.outerHTML')
-        
-        m = re.search(r'(?:NOMOR|No.Antrean)[:\s]*(\d+)', result_html, re.IGNORECASE)
+
+        # Check result
+        result_html = await page.get_content()
+        m = re.search(r'(?:NOMOR|No\.?Antrean)[:\s]*(\d+)', result_html, re.IGNORECASE)
         if m:
             nomor = m.group(1)
             print("\n" + "="*50)
             print(f"   [!] BERHASIL! NOMOR: {nomor}")
             print("="*50)
-            print(f"\n[*] Silica ke {belm['name']} ya!")
+            print(f"\n[*] Silakan ke {belm['name']} ya!")
             save_checkpoint({"status": "success", "belm": belm_key, "nomor": nomor})
-            browser.stop()
-            return
-    
-    print("\n[!] Gagal mengambil antrian")
-    save_checkpoint({"status": "failed", "belm": belm_key})
-    browser.stop()
+            return True
+        else:
+            print("\n[!] Gagal mengambil antrian: queue number not found")
+            with open("antrean_failed.html", "w", encoding="utf-8") as f:
+                f.write(result_html)
+            print("[*] HTML saved to antrean_failed.html")
+            return False
+    else:
+        print("\n[!] Unexpected page content")
+        print(f"[DEBUG] HTML snippet: {html[:500]}")
+        with open("antrean_failed.html", "w", encoding="utf-8") as f:
+            f.write(html)
+        return False
 
-async def run_schedule(target_hour, target_min, belm_key):
-    """Schedule mode: 2 menit sebelum login"""
-    run_hour = target_hour
-    run_min = target_min - 2
-    if run_min < 0:
-        run_hour -= 1
-        run_min += 60
-    
-    print("\n" + "="*50)
-    print("  ANTREAN BOT - SCHEDULE MODE")
-    print("="*50)
-    print(f"  BELM: {BELM_MAP[belm_key]['name']}")
-    print(f"  Login:  {run_hour:02d}:{run_min:02d}")
-    print(f"  Target: {target_hour:02d}:{target_min:02d}")
-    print("="*50 + "\n")
-    
-    # Phase 1: Tunggu
-    print("[*] Menunggu login time...")
-    while True:
-        now = datetime.now()
-        ch, cm = now.hour, now.minute
-        if ch == run_hour and cm >= run_min:
-            break
-        if ch > run_hour or (ch == run_hour and cm > run_min + 1):
-            print("\n[!] Waktu sudah terlewat!")
-            return
-        if now.second < 2:
-            print(f"  [{ch:02d}:{cm:02d}] Menunggu...")
-        time.sleep(30)
-    
-    # Phase 1: Login dan stay alive
-    print(f"\n[*] {run_hour:02d}:{run_min:02d} - LOGIN & STAY ALIVE...")
-    print("-"*30)
-    
-    browser = await uc.start(
-        browser_executable_path=_find_chrome(),
-        headless=False,
-        user_data_dir=_get_profile_dir(),
-    )
-    
+async def run_bot(belm_key):
+    """Main bot flow"""
+    print(f"\n{'='*50}")
+    print(f"  ANTREAN BOT - {BELM_MAP[belm_key]['name']}")
+    print(f"{'='*50}\n")
+
+    print("[*] Starting Chrome...")
+    try:
+        browser = await uc.start(
+            browser_executable_path=_find_chrome(),
+            headless=False,
+            user_data_dir=_get_profile_dir(),
+        )
+    except Exception as e:
+        print(f"[!] Browser start error: {e}")
+        return
+
     page = await browser.get("https://antrean.logammulia.com/login")
-    await asyncio.sleep(3)
-    
-    captcha = await page.evaluate('''(document.querySelector('label[for="aritmetika"]') || {}).innerText || "Error"''')
-    print(f"[*] Captcha: {captcha}")
-    answer = solve_captcha(captcha)
-    print(f"[*] Jawaban: {answer}")
-    
-    sitekey = "0x4AAAAAACJ3z-FPGdMU19nQ"
-    await page.evaluate(f'''
-        (() => {{
-            if (document.getElementById('_ts_box')) return;
-            window._tsToken = null;
-            const wrap = document.createElement('div');
-            wrap.id = '_ts_box';
-            wrap.style = 'position:fixed;top:20px;left:20px;z-index:2147483647;';
-            document.body.appendChild(wrap);
-            window._tsLoad = function () {{
-                turnstile.render('#_ts_box', {{
-                    sitekey: '{sitekey}',
-                    callback: function(token) {{ window._tsToken = token; }}
-                }});
-            }};
-            const s = document.createElement('script');
-            s.src = 'https://challenges.cloudflare.com/turnstile/v0/api.js?onload=_tsLoad&render=explicit';
-            document.head.appendChild(s);
-        }})();
-    ''')
-    await asyncio.sleep(8)
-    
-    await page.evaluate(f'document.querySelector(\'input[name="username"]\').value = "{EMAIL}"')
-    await page.evaluate(f'document.querySelector(\'input[name="password"]\').value = "{PASSWORD}"')
-    await page.evaluate(f'document.querySelector(\'input[name="aritmetika"]\').value = "{answer}"')
-    await asyncio.sleep(1)
-    print("[*] Submitting...")
-    await page.evaluate('document.querySelector(\'button[type="submit"]\').click()')
+    print("[*] Page loaded, waiting 5s for Cloudflare...")
     await asyncio.sleep(5)
     
-    html = await page.evaluate('document.documentElement.outerHTML')
-    if "logout" in html.lower():
-        print("[+] LOGIN BERHASIL!")
-        save_checkpoint({"status": "logged_in", "belm": belm_key, "step": "waiting"})
+    # Check current URL to see if redirected (already logged in)
+    current_url = await get_url(page)
+    print(f"[*] Current URL: {current_url}")
+    
+    if '/login' in current_url:
+        print("[*] On login page, need to login...")
+        login_success = await do_login(page, browser)
+        if not login_success:
+            print("[!] Login failed, exiting...")
+            try:
+                await browser.stop()
+            except:
+                pass
+            return
     else:
-        print("[-] Login gagal")
-        browser.stop()
-        return
+        print("[+] Already logged in! (redirected to /users or /antrean)")
     
-    # Phase 2: Tunggu target time
-    print("\n[*] Browser stay alive...")
-    while True:
-        now = datetime.now()
-        ch, cm = now.hour, now.minute
-        if ch == target_hour and cm >= target_min:
-            break
-        if ch > target_hour or (ch == target_hour and cm > target_min + 1):
-            print("\n[!] Waktu sudah terlewat!")
-            browser.stop()
-            return
-        if now.second < 2:
-            print(f"  [{ch:02d}:{cm:02d}] Waiting...")
-        time.sleep(30)
-    
-    # Phase 2: Ambil antrian
-    print(f"\n[*] {target_hour:02d}:{target_min:02d} - AMBIL ANTREAN!")
-    print("-"*30)
-    
-    await page.evaluate('window.location.href = "https://antrean.logammulia.com/antrean"')
+    # Take antrean
+    success = await take_antrean(page, browser, belm_key)
+
     await asyncio.sleep(3)
-    
-    belm = BELM_MAP[belm_key]
-    await page.evaluate(f'document.querySelector("#site").value = "{belm["id"]}"')
-    await asyncio.sleep(0.5)
-    await page.evaluate('document.querySelector("button").click()')
-    await asyncio.sleep(3)
-    
-    html = await page.evaluate('document.documentElement.outerHTML')
-    
-    if 'class="text-primary">Kuota Tidak Tersedia</h2>' in html:
-        print(f"\n[!] {belm['name']}: KUOTA KOSONG")
-        print("\n[*] Coba lagi besok ya!\n")
-        save_checkpoint({"status": "no_slot", "belm": belm_key})
-        browser.stop()
-        return
-    
-    if 'action="/masuk-pool"' in html:
-        print("[+] ADA KUOTA! Mengambil...")
-        
-        await page.evaluate('''
-            (() => {
-                const form = document.querySelector('form[action*="masuk-pool"]');
-                if (!form) return;
-                const fd = new FormData(form);
-                const params = new URLSearchParams(fd).toString();
-                fetch(form.action, {
-                    method: "POST",
-                    body: params,
-                    headers: {"Content-Type": "application/x-www-form-urlencoded"}
-                }).then(r => r.text()).then(html => window._result = html);
-            })()
-        ''')
-        await asyncio.sleep(5)
-        
-        result_html = await page.evaluate('window._result || document.documentElement.outerHTML')
-        
-        m = re.search(r'(?:NOMOR|No.Antrean)[:\s]*(\d+)', result_html, re.IGNORECASE)
-        if m:
-            nomor = m.group(1)
-            print("\n" + "="*50)
-            print(f"   [!] BERHASIL! NOMOR: {nomor}")
-            print("="*50)
-            save_checkpoint({"status": "success", "belm": belm_key, "nomor": nomor})
-            browser.stop()
-            return
-    
-    print("\n[!] Gagal")
-    save_checkpoint({"status": "failed", "belm": belm_key})
-    browser.stop()
-    
-    await page.evaluate('window.location.href = "https://antrean.logammulia.com/antrean"')
-    await asyncio.sleep(3)
-    
-    belm = BELM_MAP[belm_key]
-    await page.evaluate(f'document.querySelector("#site").value = "{belm["id"]}"')
-    await asyncio.sleep(0.5)
-    await page.evaluate('document.querySelector("button").click()')
-    await asyncio.sleep(3)
-    
-    html = await page.evaluate('document.documentElement.outerHTML')
-    
-    if 'class="text-primary">Kuota Tidak Tersedia</h2>' in html:
-        print(f"[-] Kuota tidak tersedia")
-        save_checkpoint({"status": "no_slot", "belm": belm_key})
-        browser.stop()
-        return
-    
-    if 'action="/masuk-pool"' in html:
-        print("[+] KUOTA TERSEDIA! Submit...")
-        
-        await page.evaluate('''
-            (() => {
-                const form = document.querySelector('form[action*="masuk-pool"]');
-                if (!form) return;
-                const fd = new FormData(form);
-                const params = new URLSearchParams(fd).toString();
-                fetch(form.action, {
-                    method: "POST",
-                    body: params,
-                    headers: {"Content-Type": "application/x-www-form-urlencoded"}
-                }).then(r => r.text()).then(html => window._result = html);
-            })()
-        ''')
-        await asyncio.sleep(5)
-        
-        result_html = await page.evaluate('window._result || document.documentElement.outerHTML')
-        
-        m = re.search(r'(?:NOMOR|No.Antrean)[:\s]*(\d+)', result_html, re.IGNORECASE)
-        if m:
-            nomor = m.group(1)
-            print(f"\n[+] BERHASIL! Nomor: {nomor}")
-            save_checkpoint({"status": "success", "belm": belm_key, "nomor": nomor})
-            browser.stop()
-            return
-    
-    print("[-] Gagal")
-    save_checkpoint({"status": "failed", "belm": belm_key})
-    browser.stop()
+    try:
+        await browser.stop()
+    except:
+        pass
+
+    if success:
+        print("\n[+] Bot completed successfully!")
+    else:
+        print("\n[!] Bot completed with errors.")
 
 if __name__ == "__main__":
-    import sys
-    
-    if len(sys.argv) < 2 or sys.argv[1] == "--help":
-        print("""
-ANTREAN BOT
-==========
-Usage:
-    python antrean.py --test HH:MM [belm]  # Test jadwal
-    python antrean.py belm              # Langsung jalan
-    python antrean.py --checkpoint     # Cek checkpoint
-""")
+    if len(sys.argv) < 2:
+        print("Usage: python antrean.py <belm>")
+        print("Available BELM: puri, setiabudi, bintaro, darmo, pakuwon, bandung, bekasi, bogor")
         sys.exit(1)
-    
-    if sys.argv[1] == "--test" and len(sys.argv) >= 3:
-        try:
-            th, tm = map(int, sys.argv[2].split(":"))
-        except:
-            print("[-] Format HH:MM")
-            sys.exit(1)
-        belm = sys.argv[3] if len(sys.argv) > 3 else "bintaro"
-        asyncio.run(run_schedule(th, tm, belm))
-        sys.exit(1)
-    
-    if sys.argv[1] == "--checkpoint":
-        if os.path.exists(CHECKPOINT_FILE):
-            with open(CHECKPOINT_FILE, "r") as f:
-                print(f.read())
-        else:
-            print("No checkpoint")
-        sys.exit(1)
-    
     belm = sys.argv[1].lower()
+    if belm not in BELM_MAP:
+        print(f"Invalid BELM: {belm}")
+        print("Available BELM: puri, setiabudi, bintaro, darmo, pakuwon, bandung, bekasi, bogor")
+        sys.exit(1)
     asyncio.run(run_bot(belm))

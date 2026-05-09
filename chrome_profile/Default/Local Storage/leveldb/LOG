@@ -1,0 +1,4 @@
+2026/05/01-10:43:21.422 6d80 Reusing MANIFEST C:\laragon\www\ggantam\chrome_profile\Default\Local Storage\leveldb/MANIFEST-000001
+2026/05/01-10:43:21.432 6d80 Recovering log #3
+2026/05/01-10:43:21.432 6d80 (ignoring error) C:\laragon\www\ggantam\chrome_profile\Default\Local Storage\leveldb/000003.log: dropping 2914 bytes; Corruption: checksum mismatch
+2026/05/01-10:43:21.436 6d80 Reusing old log C:\laragon\www\ggantam\chrome_profile\Default\Local Storage\leveldb/000003.log 
